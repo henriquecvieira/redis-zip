@@ -66,7 +66,7 @@ const startup = async () => {
       console.log("Redis Client Connect")
     })
     .catch((err) => {
-      console.log("Redis Client Error::", err)
+      console.log("Redis Client Error:", err)
     })
   client.on("error", (err) => {
     console.error("Redis Client Error:", err)
