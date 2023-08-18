@@ -1,79 +1,113 @@
-import express from "express"
-import redis from "redis"
-import archiver from "archiver"
-import fs from "fs"
-import { promises as fsPromises } from "fs"
-import { v4 as uuidv4 } from "uuid"
-import { promisify } from "util"
+import fs from 'fs';
+import express from 'express';
+import multer from 'multer';
+import JSONStream from 'JSONStream';
+import JSZip from 'jszip';
+import path from 'path';
+import { Readable } from 'stream';
+import Queue from 'bull';
+import BullBoard from 'bull-board';
+import Redis from 'ioredis';
 
-const app = express()
-app.use(express.json())
+const app = express();
+app.use(express.json());
 
-const client = redis.createClient({
-  host: "localhost", // Coloque o endereço do servidor Redis aqui
-  port: 6379, // Coloque a porta do servidor Redis aqui
-})
+// Configuração do cliente Redis
+const redisConfig = {
+  host: '127.0.0.1', // Coloque o host correto do seu Redis
+  port: 6379, // Coloque a porta correta do seu Redis
+};
 
-const setAsync = promisify(client.set).bind(client)
-const quitAsync = promisify(client.quit).bind(client)
+// Crie um cliente Redis
+const redisClient = new Redis(redisConfig);
 
-app.post("/saveUser", async (req, res) => {
-  try {
-    const { nome, email } = req.body
-    const id = uuidv4()
-    const tempFilePath = `${id}.json`
+const minhaFila = "minha-fila"
 
-    await fsPromises.writeFile(
-      tempFilePath,
-      JSON.stringify({ id, nome, email })
-    )
+// Crie uma instância da fila usando Bull
+const queue = new Queue(minhaFila, {
+  createClient: () => redisClient, // Passa o cliente Redis para a fila
+});
 
-    const zipFilePath = `${id}.zip`
-    const output = fs.createWriteStream(zipFilePath)
-    const archive = archiver("zip", {
-      zlib: { level: 9 },
-    })
 
-    archive.pipe(output)
-    archive.file(tempFilePath, { name: "usuario.json" })
-    archive.finalize()
 
-    await new Promise((resolve) => {
-      output.on("close", resolve)
-    })
+// Configurar o armazenamento dos arquivos com o Multer
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`);
+  },
+});
 
-    const zipData = await fsPromises.readFile(zipFilePath)
+const upload = multer({ storage });
 
-    await setAsync(id, zipData) // Aguardar a escrita no Redis
+// Nome do arquivo zipado
+let zipFilePath = '';
 
-    fsPromises.unlink(tempFilePath)
-    fsPromises.unlink(zipFilePath)
+// Rota para enviar um arquivo ZIP
+app.post('/upload', upload.single('document'), (req, res) => {
+  zipFilePath = 'uploads/' + req.file.filename;
+  processZipFile(zipFilePath);
+  res.json({ message: 'Arquivo ZIP enviado com sucesso!' + req.file.filename });
+});
 
-    quitAsync() // Fechar o cliente Redis após a escrita no Redis
 
-    return res.json({ id, message: "Usuário salvo com sucesso no Redis." })
-  } catch (err) {
-    console.error(err)
-    return res.status(500).json({ error: "Erro interno do servidor." })
-  }
-})
+// Configura o BullBoard para usar a fila
+BullBoard.setQueues([queue]);
 
-const PORT = 3001
-const startup = async () => {
-  await client
-    .connect()
-    .then(() => {
-      console.log("Redis Client Connect")
-    })
-    .catch((err) => {
-      console.log("Redis Client Error:", err)
-    })
-  client.on("error", (err) => {
-    console.error("Redis Client Error:", err)
-  })
+// Rota para o dashboard
+app.use('/dashboard', BullBoard.UI);
 
-  app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`)
-  })
+
+// Função para adicionar um item à fila
+async function adicionarItemAFila(data) {
+  // Adiciona o item à fila
+  await queue.add(data);
+
+  console.log(`Item adicionado à fila: ${JSON.stringify(data)}`);
 }
-startup()
+
+
+
+// Crie uma função para ler e processar o arquivo JSON zipado
+async function processZipFile(zipFilePath) {
+  const filePath = path.resolve(zipFilePath);
+  const readStream = fs.createReadStream(filePath);
+  const jszip = new JSZip();
+
+  const chunks = [];
+  readStream.on('data', (chunk) => chunks.push(chunk));
+  readStream.on('end', async () => {
+    const buffer = Buffer.concat(chunks);
+    const zip = await jszip.loadAsync(buffer);
+
+    const zipObjectKeys = Object.keys(zip.files);
+    for (const key of zipObjectKeys) {
+      if (zip.files[key].dir) continue; // Ignorar diretórios
+      const fileData = await zip.files[key].async('string');
+      const jsonStream = JSONStream.parse('*');
+      const jsonReadStream = new Readable();
+      jsonReadStream.push(fileData);
+      jsonReadStream.push(null);
+
+      jsonReadStream.pipe(jsonStream).on('data', async (data) => {
+        await adicionarItemAFila(data)
+        console.log(data);
+      });
+    }
+
+    console.log('Leitura do arquivo JSON concluída.');
+  });
+
+  readStream.on('error', (error) => {
+    console.error('Erro ao ler o arquivo:', error);
+  });
+
+}
+
+
+
+app.listen(3333, () => {
+  console.log(`Servidor rodando na porta 3333`);
+});
